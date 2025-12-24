@@ -1,0 +1,8 @@
+{
+  "name": "conductor",
+  "description": "Orchestrate multi-AI development teams. Claude conducts, Gemini builds & designs, OpenCode tests. Features: /conductor:work command, learning loop, UI/UX design & validation, Playwright integration.",
+  "version": "3.0.0",
+  "author": {
+    "name": "alchemiststudiosDOTai"
+  }
+}

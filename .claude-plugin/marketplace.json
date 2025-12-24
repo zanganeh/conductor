@@ -1,0 +1,24 @@
+{
+  "name": "conductor-marketplace",
+  "owner": {
+    "name": "alchemiststudiosDOTai"
+  },
+  "metadata": {
+    "description": "Conductor - Orchestrate multi-AI development teams",
+    "version": "3.0.0"
+  },
+  "plugins": [
+    {
+      "name": "conductor",
+      "source": "./",
+      "description": "Orchestrate multi-AI development teams. Claude conducts, Gemini builds & designs, OpenCode tests. Features: /conductor:work command, learning loop, UI/UX design & validation phases.",
+      "version": "3.0.0",
+      "author": {
+        "name": "alchemiststudiosDOTai"
+      },
+      "license": "MIT",
+      "category": "productivity",
+      "keywords": ["conductor", "orchestration", "multi-agent", "ai-team", "gemini", "opencode", "playwright", "testing", "automation", "ui-ux", "design", "workflow", "claude-code"]
+    }
+  ]
+}
