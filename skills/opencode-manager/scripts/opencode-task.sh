@@ -1,131 +1,211 @@
-#!/bin/bash
+#!/usr/bin/env bash
+#
+# OPENCODE QA DELEGATOR
+# =====================
+# Delegates QA/testing work from Claude (Conductor) to OpenCode (Tester).
+#
+# CRITICAL: This script is for DELEGATION only.
+# If OpenCode is slow or unresponsive, DO NOT take over testing yourself.
+# Wait longer, retry with simpler tasks, or ask the user for guidance.
+#
+# Usage:
+#   ./opencode-task.sh [options] "test description"
+#   echo "test task" | ./opencode-task.sh [options]
+#
+# Options:
+#   -m MODEL      Model to use (default: opencode/glm-4.7-free)
+#   -a AGENT      Agent mode: build or plan (default: build)
+#   -t MINUTES    Timeout (default: 5, max: 10)
+#   -f FILE       File to attach (repeatable)
+#   -h            Show help
+#
 
-# Default values
-TIMEOUT_MIN=5
-MODEL="opencode/glm-4.7-free"
-AGENT="build"
-TASK=""
-FILES=()
+set -euo pipefail
 
-# Function to display usage
-usage() {
-    echo "Usage: $0 [-m model] [-a agent] [-t timeout_minutes] [-f file] [task_description]"
-    echo "  -m model    : Model in provider/model format (default: opencode/glm-4.7-free)"
-    echo "  -a agent    : Agent to use: build or plan (default: build)"
-    echo "  -t minutes  : Timeout in minutes (default: 5, max: 10)"
-    echo "  -f file     : File to attach to message (can be repeated)"
-    echo "  task_description : The task prompt (optional if provided via stdin)"
-    exit 1
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly DEFAULT_TIMEOUT=5
+readonly MAX_TIMEOUT=10
+readonly EXIT_TIMEOUT=124
+readonly DEFAULT_MODEL="opencode/glm-4.7-free"
+readonly DEFAULT_AGENT="build"
+
+# ============================================================================
+# STATE VARIABLES
+# ============================================================================
+
+timeout_minutes=$DEFAULT_TIMEOUT
+model_name="$DEFAULT_MODEL"
+agent_mode="$DEFAULT_AGENT"
+task_prompt=""
+declare -a attached_files=()
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+show_help() {
+    cat << 'HELP'
+
+OPENCODE QA DELEGATOR
+=====================
+Delegates QA/testing work from Claude (Conductor) to OpenCode (Tester).
+
+REMINDER: If OpenCode is slow, DO NOT take over testing yourself.
+          Wait longer, retry, or ask the user for guidance.
+
+Usage:
+    ./opencode-task.sh [options] "test description"
+    echo "test task" | ./opencode-task.sh [options]
+
+Options:
+    -m MODEL      Model to use (default: opencode/glm-4.7-free)
+    -a AGENT      Agent mode: build or plan (default: build)
+    -t MINUTES    Timeout in minutes (default: 5, max: 10)
+    -f FILE       File to attach (can repeat)
+    -h            Show this help
+
+Examples:
+    ./opencode-task.sh "Test login form validation"
+    ./opencode-task.sh -t 8 "Full QA on checkout flow"
+    ./opencode-task.sh -a plan "Analyze test coverage"
+
+HELP
 }
 
-# Parse options
-while getopts ":m:t:a:f:" opt; do
-  case ${opt} in
-    m)
-      MODEL="${OPTARG}"
-      ;;
-    t)
-      TIMEOUT_MIN="${OPTARG}"
-      ;;
-    a)
-      AGENT="${OPTARG}"
-      ;;
-    f)
-      FILES+=("${OPTARG}")
-      ;;
-    \?)
-      echo "Invalid option: -${OPTARG}" >&2
-      usage
-      ;;
-    :)
-      echo "Option -${OPTARG} requires an argument." >&2
-      usage
-      ;;
-  esac
-done
-shift $((OPTIND -1))
+log_error() {
+    echo "[ERROR] $*" >&2
+}
 
-# Determine working directory: use CLAUDE_PROJECT_DIR if available
-if [ -n "$CLAUDE_PROJECT_DIR" ]; then
-    PROJECT_DIR="$CLAUDE_PROJECT_DIR"
-else
-    PROJECT_DIR=$(pwd)
-    echo "Warning: CLAUDE_PROJECT_DIR not set. Using current directory: $PROJECT_DIR" >&2
-fi
+log_warning() {
+    echo "[WARN] $*" >&2
+}
 
-# Validate agent
-if [ "$AGENT" != "build" ] && [ "$AGENT" != "plan" ]; then
-    echo "Error: Agent must be 'build' or 'plan'." >&2
-    exit 1
-fi
-
-# Validate and cap timeout
-if ! [[ "$TIMEOUT_MIN" =~ ^[0-9]+$ ]]; then
-    echo "Error: Timeout must be an integer (minutes)." >&2
-    exit 1
-fi
-
-if [ "$TIMEOUT_MIN" -gt 10 ]; then
-    echo "Warning: Timeout of $TIMEOUT_MIN minutes exceeds limit. Capping at 10 minutes." >&2
-    TIMEOUT_MIN=10
-fi
-
-# Convert minutes to seconds for the timeout command
-TIMEOUT_SEC=$((TIMEOUT_MIN * 60))
-
-# Get task description from argument or stdin
-if [ $# -ge 1 ]; then
-    TASK="$*"
-else
-    # Check if stdin has data
-    if [ ! -t 0 ]; then
-        TASK=$(cat)
+get_working_directory() {
+    if [[ -n "${CLAUDE_PROJECT_DIR:-}" && -d "$CLAUDE_PROJECT_DIR" ]]; then
+        echo "$CLAUDE_PROJECT_DIR"
+    else
+        log_warning "CLAUDE_PROJECT_DIR not set. Using current directory."
+        pwd
     fi
-fi
+}
 
-if [ -z "$TASK" ]; then
-    echo "Error: No task description provided." >&2
-    usage
-fi
+validate_agent_mode() {
+    local mode="$1"
 
-# Build the opencode command arguments
-CMD="opencode"
-ARGS=("run" "--model" "$MODEL" "--agent" "$AGENT")
+    if [[ "$mode" != "build" && "$mode" != "plan" ]]; then
+        log_error "Agent mode must be 'build' or 'plan'."
+        exit 1
+    fi
+}
 
-# Add files if specified
-for file in "${FILES[@]}"; do
-    ARGS+=("--file" "$file")
+validate_timeout() {
+    local value="$1"
+
+    if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+        log_error "Timeout must be a positive integer."
+        exit 1
+    fi
+
+    if (( value > MAX_TIMEOUT )); then
+        log_warning "Timeout $value exceeds max ($MAX_TIMEOUT). Using maximum."
+        echo "$MAX_TIMEOUT"
+    else
+        echo "$value"
+    fi
+}
+
+build_opencode_command() {
+    local -a cmd_args=("run" "--model" "$model_name" "--agent" "$agent_mode")
+
+    for file in "${attached_files[@]}"; do
+        cmd_args+=("--file" "$file")
+    done
+
+    cmd_args+=("$task_prompt")
+
+    printf '%s\n' "${cmd_args[@]}"
+}
+
+check_output_for_issues() {
+    local output="$1"
+
+    if echo "$output" | grep -iq "error\|failed\|exception"; then
+        log_warning "OpenCode reported potential issues. Review output carefully."
+        log_warning "If tests failed, delegate fixes to Gemini - do NOT fix them yourself."
+    fi
+}
+
+# ============================================================================
+# ARGUMENT PARSING
+# ============================================================================
+
+while getopts ":m:a:t:f:h" opt; do
+    case $opt in
+        m) model_name="$OPTARG" ;;
+        a) agent_mode="$OPTARG" ;;
+        t) timeout_minutes="$OPTARG" ;;
+        f) attached_files+=("$OPTARG") ;;
+        h) show_help; exit 0 ;;
+        :) log_error "Option -$OPTARG requires an argument."; exit 1 ;;
+        \?) log_error "Invalid option: -$OPTARG"; show_help; exit 1 ;;
+    esac
 done
+shift $((OPTIND - 1))
 
-# Add the task as the last argument
-ARGS+=("$TASK")
+# ============================================================================
+# INPUT VALIDATION
+# ============================================================================
 
-# Change to project directory before executing
-cd "$PROJECT_DIR" || {
-    echo "Error: Cannot change to project directory: $PROJECT_DIR" >&2
+validate_agent_mode "$agent_mode"
+
+# Get task from arguments or stdin
+if [[ $# -ge 1 ]]; then
+    task_prompt="$*"
+elif [[ ! -t 0 ]]; then
+    task_prompt="$(cat)"
+fi
+
+if [[ -z "$task_prompt" ]]; then
+    log_error "No test task provided. Cannot delegate to OpenCode without instructions."
+    show_help
+    exit 1
+fi
+
+timeout_minutes=$(validate_timeout "$timeout_minutes")
+timeout_seconds=$((timeout_minutes * 60))
+
+# ============================================================================
+# EXECUTION
+# ============================================================================
+
+work_dir="$(get_working_directory)"
+cd "$work_dir" || {
+    log_error "Cannot change to directory: $work_dir"
     exit 1
 }
 
-# Use project directory as workspace reference
-WORKSPACE="$PROJECT_DIR"
+# Build command arguments
+mapfile -t cmd_args < <(build_opencode_command)
 
-# Execution with timeout
-OUTPUT=$(timeout "$TIMEOUT_SEC" "$CMD" "${ARGS[@]}" 2>&1)
-CMD_EXIT_CODE=$?
+# Execute with timeout
+output=$(timeout "$timeout_seconds" opencode "${cmd_args[@]}" 2>&1) || exit_code=$?
+exit_code=${exit_code:-0}
 
-# Check for timeout (exit code 124 is standard for GNU timeout)
-if [ $CMD_EXIT_CODE -eq 124 ]; then
-    echo "Error: Operation timed out after ${TIMEOUT_MIN} minutes." >&2
-    exit 124
+# Handle timeout
+if [[ $exit_code -eq 124 ]]; then
+    log_error "TIMEOUT: OpenCode did not complete within $timeout_minutes minutes."
+    log_error "Options: 1) Increase timeout  2) Simplify task  3) Ask user"
+    log_error "DO NOT take over and run tests yourself!"
+    exit $EXIT_TIMEOUT
 fi
 
-# Check for common errors
-if echo "$OUTPUT" | grep -qi "error\|failed"; then
-    echo "Warning: OpenCode reported potential issues. Review output carefully." >&2
-fi
+# Check for issues in output
+check_output_for_issues "$output"
 
-# Print the captured output
-echo "$OUTPUT"
-
-# Exit with the command's exit code
-exit $CMD_EXIT_CODE
+# Output result
+echo "$output"
+exit $exit_code

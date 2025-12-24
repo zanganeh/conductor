@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2025-12-24
+
+### Added
+- **Anti-Takeover Rules**: Explicit rules preventing Claude from doing work itself when tools are slow
+  - New Rule #5: "Claude NEVER does the work itself"
+  - Detailed WRONG vs CORRECT response table for common scenarios
+  - Escalation path: wait → retry → simplify → ask user → NEVER take over
+- Enhanced error handling table with "⚠️ NEVER Do This" column
+
+### Changed
+- **Refactored all task delegation scripts** with improved readability and structure:
+  - `gemini-task.ps1` / `gemini-task.sh` - Better parameter names, modular functions
+  - `opencode-task.ps1` / `opencode-task.sh` - Clear anti-takeover warnings in output
+- Scripts now display explicit reminders: "DO NOT take over and run tests yourself!"
+- Timeout errors now suggest proper escalation instead of encouraging takeover
+
+### Fixed
+- Addressed issue where Claude would bypass team structure when OpenCode was slow
+- Scripts now reinforce conductor-only behavior in error messages
+
 ## [3.0.0] - 2025-12-24
 
 ### Changed

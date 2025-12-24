@@ -1,170 +1,226 @@
 <#
 .SYNOPSIS
-    Wrapper script for Gemini CLI with timeout and options.
+    Delegates a coding task to Gemini CLI (the Builder AI).
 
 .DESCRIPTION
-    Executes Gemini CLI with configurable timeout, model selection, and quiet mode.
-    Automatically runs in the user's project directory (CLAUDE_PROJECT_DIR), not the plugin directory.
+    This script is used by Claude (Conductor) to delegate implementation work to Gemini.
+    Gemini runs in --yolo mode to automatically apply changes without confirmation.
 
-.PARAMETER Task
-    The task description/prompt for Gemini.
+    IMPORTANT: This script is for DELEGATION only. Claude should NEVER do the work itself.
 
-.PARAMETER Model
-    Specify the model to use (optional).
+.PARAMETER Prompt
+    The implementation task to delegate to Gemini.
 
-.PARAMETER TimeoutMinutes
-    Timeout in minutes (default: 5, max: 10).
+.PARAMETER LLM
+    Which Gemini model to use (optional).
 
-.PARAMETER Quiet
-    Suppress stderr output.
+.PARAMETER MaxMinutes
+    How long to wait before timing out (1-10 minutes, default: 5).
 
-.PARAMETER IncludeDirectories
-    Additional directories to include in Gemini's workspace (comma-separated).
+.PARAMETER Silent
+    Hide stderr output from Gemini.
 
-.EXAMPLE
-    .\gemini-task.ps1 "Implement a login form"
-
-.EXAMPLE
-    .\gemini-task.ps1 -TimeoutMinutes 8 -Model "gemini-2.5-flash" "Fix the bug"
+.PARAMETER ExtraPaths
+    Additional directories Gemini can access (comma-separated).
 
 .EXAMPLE
-    .\gemini-task.ps1 -Quiet "Task description"
+    .\gemini-task.ps1 "Create a responsive navbar component"
 
 .EXAMPLE
-    .\gemini-task.ps1 -IncludeDirectories "C:\other\path" "Create file in external dir"
+    .\gemini-task.ps1 -MaxMinutes 8 -LLM "gemini-2.5-pro" "Refactor the auth module"
 #>
 
+[CmdletBinding()]
 param(
-    [Parameter(Position = 0, ValueFromPipeline = $true)]
-    [string]$Task,
+    [Parameter(Position = 0, ValueFromPipeline = $true, Mandatory = $false)]
+    [string]$Prompt,
 
-    [Alias("m")]
-    [string]$Model,
+    [Alias("model", "m")]
+    [string]$LLM,
 
-    [Alias("t")]
+    [Alias("timeout", "t")]
     [ValidateRange(1, 10)]
-    [int]$TimeoutMinutes = 5,
+    [int]$MaxMinutes = 5,
 
-    [Alias("q")]
-    [switch]$Quiet,
+    [Alias("quiet", "q")]
+    [switch]$Silent,
 
-    [Alias("i")]
-    [string[]]$IncludeDirectories
+    [Alias("include", "i")]
+    [string[]]$ExtraPaths
 )
 
-# Determine the working directory: use CLAUDE_PROJECT_DIR if available, otherwise current directory
-$ProjectDir = $env:CLAUDE_PROJECT_DIR
-if ([string]::IsNullOrWhiteSpace($ProjectDir)) {
-    $ProjectDir = (Get-Location).Path
-    Write-Warning "CLAUDE_PROJECT_DIR not set. Using current directory: $ProjectDir"
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+$Script:ExecutableName = "gemini"
+$Script:MaxAllowedMinutes = 10
+$Script:ExitCodeTimeout = 124
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+function Get-WorkingDirectory {
+    if ($env:CLAUDE_PROJECT_DIR -and (Test-Path $env:CLAUDE_PROJECT_DIR)) {
+        return $env:CLAUDE_PROJECT_DIR
+    }
+    Write-Warning "CLAUDE_PROJECT_DIR not set or invalid. Falling back to current directory."
+    return (Get-Location).Path
 }
 
-# Validate timeout and cap at 10
-if ($TimeoutMinutes -gt 10) {
-    Write-Warning "Timeout of $TimeoutMinutes minutes exceeds limit. Capping at 10 minutes."
-    $TimeoutMinutes = 10
+function Show-Usage {
+    Write-Host @"
+
+GEMINI TASK DELEGATOR
+=====================
+Delegates implementation work from Claude (Conductor) to Gemini (Builder).
+
+Usage:
+    .\gemini-task.ps1 [options] "task description"
+    "task" | .\gemini-task.ps1 [options]
+
+Options:
+    -LLM, -model, -m      Gemini model to use
+    -MaxMinutes, -t       Timeout in minutes (default: 5, max: 10)
+    -Silent, -quiet, -q   Suppress stderr output
+    -ExtraPaths, -i       Additional workspace directories
+
+Examples:
+    .\gemini-task.ps1 "Build a login form with validation"
+    .\gemini-task.ps1 -MaxMinutes 8 "Implement full CRUD for users"
+    .\gemini-task.ps1 -ExtraPaths "C:\shared\lib" "Use shared utilities"
+
+"@
 }
 
-# Get task from pipeline if not provided as argument
-if (-not $Task -and $MyInvocation.ExpectingInput) {
-    $Task = $input | Out-String
+function Build-GeminiArguments {
+    param([string]$TaskPrompt, [string]$Model, [string[]]$IncludeDirs)
+
+    $args = @("--yolo", "-o", "text")
+
+    if ($Model) {
+        $args += @("--model", $Model)
+    }
+
+    foreach ($dir in $IncludeDirs) {
+        if ($dir) {
+            $args += @("--include-directories", $dir)
+        }
+    }
+
+    $args += $TaskPrompt
+    return $args
 }
 
-# Validate task
-if ([string]::IsNullOrWhiteSpace($Task)) {
-    Write-Error "Error: No task description provided."
-    Write-Host "Usage: .\gemini-task.ps1 [-Model model] [-Quiet] [-TimeoutMinutes minutes] [-IncludeDirectories dirs] [task_description]"
-    Write-Host "  -Model, -m             : Specify the model to use"
-    Write-Host "  -Quiet, -q             : Quiet mode (suppress stderr)"
-    Write-Host "  -TimeoutMinutes, -t    : Timeout in minutes (default: 5, max: 10)"
-    Write-Host "  -IncludeDirectories, -i: Additional directories for Gemini workspace"
-    Write-Host "  task_description       : The task prompt (can also be piped)"
+function Invoke-GeminiWithTimeout {
+    param(
+        [string[]]$Arguments,
+        [string]$WorkDir,
+        [int]$TimeoutSeconds,
+        [bool]$SuppressStderr
+    )
+
+    $jobScript = {
+        param($cmdArgs, $suppressErr, $directory)
+        Set-Location $directory
+        if ($suppressErr) {
+            & gemini @cmdArgs 2>$null
+        } else {
+            & gemini @cmdArgs 2>&1
+        }
+    }
+
+    $job = Start-Job -ScriptBlock $jobScript -ArgumentList @(,$Arguments), $SuppressStderr, $WorkDir
+    $finished = Wait-Job -Job $job -Timeout $TimeoutSeconds
+
+    if ($null -eq $finished) {
+        Stop-Job -Job $job -ErrorAction SilentlyContinue
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        return @{ TimedOut = $true; Output = $null; ExitCode = $Script:ExitCodeTimeout }
+    }
+
+    $result = Receive-Job -Job $job
+    $code = if ($job.State -eq 'Completed') { 0 } else { 1 }
+    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+
+    return @{ TimedOut = $false; Output = $result; ExitCode = $code }
+}
+
+function Test-WorkspaceErrors {
+    param([string]$OutputText, [string]$Workspace)
+
+    if ($OutputText -match "must be within one of the workspace directories") {
+        Write-Error "WORKSPACE RESTRICTION: Gemini cannot write outside: $Workspace"
+        Write-Error "Use -ExtraPaths to include additional directories."
+        return $true
+    }
+
+    if ($OutputText -match "File path must be within") {
+        Write-Warning "PATH REWRITE DETECTED: Gemini may have changed the target location."
+        Write-Warning "Verify output files are in expected location: $Workspace"
+    }
+
+    return $false
+}
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+# Handle piped input
+if (-not $Prompt -and $MyInvocation.ExpectingInput) {
+    $Prompt = ($input | Out-String).Trim()
+}
+
+# Validate we have a task
+if ([string]::IsNullOrWhiteSpace($Prompt)) {
+    Write-Error "No task provided. Cannot delegate to Gemini without instructions."
+    Show-Usage
     exit 1
 }
 
-# Build the gemini command arguments
-$geminiArgs = @("--yolo", "-o", "text")
-
-if ($Model) {
-    $geminiArgs += "--model"
-    $geminiArgs += $Model
+# Cap timeout at maximum
+if ($MaxMinutes -gt $Script:MaxAllowedMinutes) {
+    Write-Warning "Timeout $MaxMinutes exceeds max ($Script:MaxAllowedMinutes). Using maximum."
+    $MaxMinutes = $Script:MaxAllowedMinutes
 }
 
-# Add include-directories if specified
-if ($IncludeDirectories) {
-    foreach ($dir in $IncludeDirectories) {
-        $geminiArgs += "--include-directories"
-        $geminiArgs += $dir
-    }
-}
+# Setup
+$workDir = Get-WorkingDirectory
+$cmdArgs = Build-GeminiArguments -TaskPrompt $Prompt -Model $LLM -IncludeDirs $ExtraPaths
+$timeoutSec = $MaxMinutes * 60
 
-$geminiArgs += $Task
+Write-Verbose "Delegating to Gemini in: $workDir"
+Write-Verbose "Timeout: $MaxMinutes minutes"
 
-# Use project directory as workspace
-$Workspace = $ProjectDir
-
-# Convert timeout to seconds
-$TimeoutSeconds = $TimeoutMinutes * 60
-
+# Execute
 try {
-    # Create a job to run gemini with timeout in the project directory
-    $job = Start-Job -ScriptBlock {
-        param($args, $quiet, $workDir)
-        Set-Location $workDir
-        if ($quiet) {
-            & gemini @args 2>$null
-        } else {
-            & gemini @args 2>&1
-        }
-    } -ArgumentList @(, $geminiArgs), $Quiet, $ProjectDir
+    $result = Invoke-GeminiWithTimeout `
+        -Arguments $cmdArgs `
+        -WorkDir $workDir `
+        -TimeoutSeconds $timeoutSec `
+        -SuppressStderr $Silent
 
-    # Wait for job with timeout
-    $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
-
-    if ($null -eq $completed) {
-        # Timeout occurred
-        Stop-Job -Job $job
-        Remove-Job -Job $job -Force
-        if (-not $Quiet) {
-            Write-Error "Error: Operation timed out after $TimeoutMinutes minutes."
-        }
-        exit 124
+    if ($result.TimedOut) {
+        Write-Error "TIMEOUT: Gemini did not complete within $MaxMinutes minutes."
+        Write-Error "Consider breaking the task into smaller pieces or increasing timeout."
+        exit $Script:ExitCodeTimeout
     }
 
-    # Get output and exit code
-    $output = Receive-Job -Job $job
-    $exitCode = $job.ChildJobs[0].JobStateInfo.Reason.ExitCode
+    $outputText = $result.Output | Out-String
 
-    # If exit code is null, try to determine from job state
-    if ($null -eq $exitCode) {
-        $exitCode = if ($job.State -eq 'Completed') { 0 } else { 1 }
-    }
-
-    Remove-Job -Job $job -Force
-
-    # Check for workspace restriction errors (Gemini silently rewrites paths)
-    $outputStr = $output | Out-String
-    if ($outputStr -match "must be within one of the workspace directories") {
-        Write-Error "WORKSPACE ERROR: Gemini cannot write outside current workspace: $Workspace"
-        Write-Error "Target path was silently rewritten. Change directory to target location first."
+    if (Test-WorkspaceErrors -OutputText $outputText -Workspace $workDir) {
         exit 2
     }
 
-    # Warn if output suggests path was rewritten (heuristic check)
-    if ($outputStr -match "File path must be within") {
-        Write-Warning "WORKSPACE WARNING: Gemini may have rewritten the target path."
-        Write-Warning "Current workspace: $Workspace"
-        Write-Warning "Verify files were created in the expected location."
+    if ($result.Output) {
+        Write-Output $result.Output
     }
 
-    # Print output
-    if ($output) {
-        Write-Output $output
-    }
-
-    exit $exitCode
+    exit $result.ExitCode
 
 } catch {
-    Write-Error "Error executing gemini: $_"
+    Write-Error "Failed to execute Gemini: $_"
     exit 1
 }

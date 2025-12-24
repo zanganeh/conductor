@@ -1,158 +1,218 @@
 <#
 .SYNOPSIS
-    Wrapper script for OpenCode CLI with timeout and options.
+    Delegates a QA/testing task to OpenCode CLI (the Tester AI).
 
 .DESCRIPTION
-    Executes OpenCode CLI in non-interactive mode with configurable timeout, model selection, and output format.
-    Automatically runs in the user's project directory (CLAUDE_PROJECT_DIR), not the plugin directory.
+    This script is used by Claude (Conductor) to delegate testing work to OpenCode.
+    OpenCode uses GLM-4.7 to run browser-based QA tests and report issues.
 
-.PARAMETER Task
-    The task description/prompt for OpenCode.
+    IMPORTANT: This script is for DELEGATION only. Claude should NEVER run tests itself,
+    even if OpenCode is slow or unresponsive. Wait, retry, or ask the user.
 
-.PARAMETER Model
-    Specify the model to use in provider/model format (default: opencode/glm-4.7-free).
+.PARAMETER Prompt
+    The testing task to delegate to OpenCode.
 
-.PARAMETER TimeoutMinutes
-    Timeout in minutes (default: 5, max: 10).
+.PARAMETER LLM
+    Which model to use (default: opencode/glm-4.7-free).
 
-.PARAMETER Agent
-    Agent to use (build or plan).
+.PARAMETER MaxMinutes
+    How long to wait before timing out (1-10 minutes, default: 5).
 
-.PARAMETER Files
-    Files to attach to the message.
+.PARAMETER Mode
+    Agent mode: 'build' for implementation, 'plan' for analysis (default: build).
 
-.EXAMPLE
-    .\opencode-task.ps1 "Implement a login form"
-
-.EXAMPLE
-    .\opencode-task.ps1 -TimeoutMinutes 8 -Model "opencode/glm-4.7-free" "Fix the bug"
+.PARAMETER Attachments
+    Files to include with the task.
 
 .EXAMPLE
-    .\opencode-task.ps1 -Agent plan "Analyze this codebase"
+    .\opencode-task.ps1 "Test the login form at http://localhost:3000/login"
+
+.EXAMPLE
+    .\opencode-task.ps1 -MaxMinutes 8 "Run full QA suite on the dashboard"
 #>
 
+[CmdletBinding()]
 param(
-    [Parameter(Position = 0, ValueFromPipeline = $true)]
-    [string]$Task,
+    [Parameter(Position = 0, ValueFromPipeline = $true, Mandatory = $false)]
+    [string]$Prompt,
 
-    [Alias("m")]
-    [string]$Model = "opencode/glm-4.7-free",
+    [Alias("model", "m")]
+    [string]$LLM = "opencode/glm-4.7-free",
 
-    [Alias("t")]
+    [Alias("timeout", "t")]
     [ValidateRange(1, 10)]
-    [int]$TimeoutMinutes = 5,
+    [int]$MaxMinutes = 5,
 
-    [Alias("a")]
+    [Alias("agent", "a")]
     [ValidateSet("build", "plan")]
-    [string]$Agent = "build",
+    [string]$Mode = "build",
 
-    [Alias("f")]
-    [string[]]$Files
+    [Alias("files", "f")]
+    [string[]]$Attachments
 )
 
-# Determine the working directory: use CLAUDE_PROJECT_DIR if available, otherwise current directory
-$ProjectDir = $env:CLAUDE_PROJECT_DIR
-if ([string]::IsNullOrWhiteSpace($ProjectDir)) {
-    $ProjectDir = (Get-Location).Path
-    Write-Warning "CLAUDE_PROJECT_DIR not set. Using current directory: $ProjectDir"
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+$Script:ExecutableName = "opencode"
+$Script:MaxAllowedMinutes = 10
+$Script:ExitCodeTimeout = 124
+$Script:DefaultModel = "opencode/glm-4.7-free"
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+function Get-WorkingDirectory {
+    if ($env:CLAUDE_PROJECT_DIR -and (Test-Path $env:CLAUDE_PROJECT_DIR)) {
+        return $env:CLAUDE_PROJECT_DIR
+    }
+    Write-Warning "CLAUDE_PROJECT_DIR not set or invalid. Falling back to current directory."
+    return (Get-Location).Path
 }
 
-# Validate timeout and cap at 10
-if ($TimeoutMinutes -gt 10) {
-    Write-Warning "Timeout of $TimeoutMinutes minutes exceeds limit. Capping at 10 minutes."
-    $TimeoutMinutes = 10
+function Show-Usage {
+    Write-Host @"
+
+OPENCODE QA DELEGATOR
+=====================
+Delegates QA/testing work from Claude (Conductor) to OpenCode (Tester).
+
+REMINDER: If OpenCode is slow, DO NOT take over testing yourself.
+          Wait longer, retry, or ask the user for guidance.
+
+Usage:
+    .\opencode-task.ps1 [options] "test description"
+    "test task" | .\opencode-task.ps1 [options]
+
+Options:
+    -LLM, -model, -m       Model to use (default: opencode/glm-4.7-free)
+    -MaxMinutes, -t        Timeout in minutes (default: 5, max: 10)
+    -Mode, -agent, -a      Agent mode: build or plan (default: build)
+    -Attachments, -f       Files to attach to the task
+
+Examples:
+    .\opencode-task.ps1 "Test login form validation"
+    .\opencode-task.ps1 -MaxMinutes 8 "Full QA on checkout flow"
+    .\opencode-task.ps1 -Mode plan "Analyze test coverage"
+
+"@
 }
 
-# Get task from pipeline if not provided as argument
-if (-not $Task -and $MyInvocation.ExpectingInput) {
-    $Task = $input | Out-String
+function Build-OpenCodeArguments {
+    param(
+        [string]$TaskPrompt,
+        [string]$Model,
+        [string]$AgentMode,
+        [string[]]$Files
+    )
+
+    $args = @("run", "--model", $Model, "--agent", $AgentMode)
+
+    foreach ($file in $Files) {
+        if ($file) {
+            $args += @("--file", $file)
+        }
+    }
+
+    $args += $TaskPrompt
+    return $args
 }
 
-# Validate task
-if ([string]::IsNullOrWhiteSpace($Task)) {
-    Write-Error "Error: No task description provided."
-    Write-Host "Usage: .\opencode-task.ps1 [-Model model] [-Agent agent] [-TimeoutMinutes minutes] [-Files files] [task_description]"
-    Write-Host "  -Model, -m          : Model in provider/model format (default: opencode/glm-4.7-free)"
-    Write-Host "  -Agent, -a          : Agent to use: build or plan (default: build)"
-    Write-Host "  -TimeoutMinutes, -t : Timeout in minutes (default: 5, max: 10)"
-    Write-Host "  -Files, -f          : Files to attach to message"
-    Write-Host "  task_description    : The task prompt (can also be piped)"
+function Invoke-OpenCodeWithTimeout {
+    param(
+        [string[]]$Arguments,
+        [string]$WorkDir,
+        [int]$TimeoutSeconds
+    )
+
+    $jobScript = {
+        param($cmdArgs, $directory)
+        Set-Location $directory
+        & opencode @cmdArgs 2>&1
+    }
+
+    $job = Start-Job -ScriptBlock $jobScript -ArgumentList @(,$Arguments), $WorkDir
+    $finished = Wait-Job -Job $job -Timeout $TimeoutSeconds
+
+    if ($null -eq $finished) {
+        Stop-Job -Job $job -ErrorAction SilentlyContinue
+        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        return @{ TimedOut = $true; Output = $null; ExitCode = $Script:ExitCodeTimeout }
+    }
+
+    $result = Receive-Job -Job $job
+    $code = if ($job.State -eq 'Completed') { 0 } else { 1 }
+    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+
+    return @{ TimedOut = $false; Output = $result; ExitCode = $code }
+}
+
+function Test-OutputForIssues {
+    param([string]$OutputText)
+
+    if ($OutputText -match "(?i)(error|failed|exception)") {
+        Write-Warning "OpenCode reported potential issues. Review the output carefully."
+        Write-Warning "If tests failed, delegate fixes to Gemini - do NOT fix them yourself."
+    }
+}
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+# Handle piped input
+if (-not $Prompt -and $MyInvocation.ExpectingInput) {
+    $Prompt = ($input | Out-String).Trim()
+}
+
+# Validate we have a task
+if ([string]::IsNullOrWhiteSpace($Prompt)) {
+    Write-Error "No test task provided. Cannot delegate to OpenCode without instructions."
+    Show-Usage
     exit 1
 }
 
-# Build the opencode command arguments
-# Using 'run' for non-interactive execution
-$opencodeArgs = @("run")
-
-# Add model
-$opencodeArgs += "--model"
-$opencodeArgs += $Model
-
-# Add agent
-$opencodeArgs += "--agent"
-$opencodeArgs += $Agent
-
-# Add files if specified
-if ($Files) {
-    foreach ($file in $Files) {
-        $opencodeArgs += "--file"
-        $opencodeArgs += $file
-    }
+# Cap timeout at maximum
+if ($MaxMinutes -gt $Script:MaxAllowedMinutes) {
+    Write-Warning "Timeout $MaxMinutes exceeds max ($Script:MaxAllowedMinutes). Using maximum."
+    $MaxMinutes = $Script:MaxAllowedMinutes
 }
 
-# Add the task as the message
-$opencodeArgs += $Task
+# Setup
+$workDir = Get-WorkingDirectory
+$cmdArgs = Build-OpenCodeArguments -TaskPrompt $Prompt -Model $LLM -AgentMode $Mode -Files $Attachments
+$timeoutSec = $MaxMinutes * 60
 
-# Use project directory as workspace
-$Workspace = $ProjectDir
+Write-Verbose "Delegating QA to OpenCode in: $workDir"
+Write-Verbose "Model: $LLM | Mode: $Mode | Timeout: $MaxMinutes min"
 
-# Convert timeout to seconds
-$TimeoutSeconds = $TimeoutMinutes * 60
-
+# Execute
 try {
-    # Create a job to run opencode with timeout in the project directory
-    $job = Start-Job -ScriptBlock {
-        param($args, $workDir)
-        Set-Location $workDir
-        & opencode @args 2>&1
-    } -ArgumentList @(, $opencodeArgs), $ProjectDir
+    $result = Invoke-OpenCodeWithTimeout `
+        -Arguments $cmdArgs `
+        -WorkDir $workDir `
+        -TimeoutSeconds $timeoutSec
 
-    # Wait for job with timeout
-    $completed = Wait-Job -Job $job -Timeout $TimeoutSeconds
-
-    if ($null -eq $completed) {
-        # Timeout occurred
-        Stop-Job -Job $job
-        Remove-Job -Job $job -Force
-        Write-Error "Error: Operation timed out after $TimeoutMinutes minutes."
-        exit 124
+    if ($result.TimedOut) {
+        Write-Error "TIMEOUT: OpenCode did not complete within $MaxMinutes minutes."
+        Write-Error "Options: 1) Increase timeout  2) Simplify task  3) Ask user"
+        Write-Error "DO NOT take over and run tests yourself!"
+        exit $Script:ExitCodeTimeout
     }
 
-    # Get output and exit code
-    $output = Receive-Job -Job $job
-    $exitCode = $job.ChildJobs[0].JobStateInfo.Reason.ExitCode
+    $outputText = $result.Output | Out-String
+    Test-OutputForIssues -OutputText $outputText
 
-    # If exit code is null, try to determine from job state
-    if ($null -eq $exitCode) {
-        $exitCode = if ($job.State -eq 'Completed') { 0 } else { 1 }
+    if ($result.Output) {
+        Write-Output $result.Output
     }
 
-    Remove-Job -Job $job -Force
-
-    # Check for common errors in output
-    $outputStr = $output | Out-String
-    if ($outputStr -match "error|failed|Error|Failed") {
-        Write-Warning "OpenCode reported potential issues. Review output carefully."
-    }
-
-    # Print output
-    if ($output) {
-        Write-Output $output
-    }
-
-    exit $exitCode
+    exit $result.ExitCode
 
 } catch {
-    Write-Error "Error executing opencode: $_"
+    Write-Error "Failed to execute OpenCode: $_"
+    Write-Error "If this persists, ask the user for guidance. Do NOT run tests yourself."
     exit 1
 }

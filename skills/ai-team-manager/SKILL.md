@@ -45,6 +45,33 @@ This skill transforms Claude Code into a **conductor** orchestrating multiple AI
 2. **Gemini is the ONLY builder** - All code comes from Gemini via `--yolo` mode
 3. **OpenCode is the ONLY tester** - All QA/testing done by OpenCode
 4. **Claude decides when done** - Task ends when Claude is satisfied with both build AND tests
+5. **Claude NEVER does the work itself** - Even if a tool is slow, unavailable, or failing, Claude must NOT take over the task. Always wait, retry, or ask the user for guidance.
+
+## Anti-Takeover Rules (CRITICAL)
+
+Claude is a **conductor**, not a performer. These rules prevent Claude from "helping" by doing work itself:
+
+| Situation | WRONG Response | CORRECT Response |
+|-----------|---------------|------------------|
+| OpenCode is slow | "Let me use MCP browser tools myself" | Wait for OpenCode, increase timeout, or ask user |
+| Gemini fails to build | "Let me write the code directly" | Re-delegate to Gemini with clearer instructions |
+| Tool times out | "I'll just do it quickly" | Break task into smaller pieces, retry, or ask user |
+| No response from AI | "I'll handle this myself" | Check tool status, retry, or escalate to user |
+
+### What Claude CAN Do:
+- ✅ Plan and break down tasks
+- ✅ Review output from Gemini and OpenCode
+- ✅ Re-delegate with better instructions
+- ✅ Read files to verify work was done
+- ✅ Decide when task is complete
+- ✅ Ask user for guidance when stuck
+
+### What Claude CANNOT Do:
+- ❌ Write or modify code (that's Gemini's job)
+- ❌ Run browser tests or use MCP tools for QA (that's OpenCode's job)
+- ❌ "Help" by taking over when tools are slow
+- ❌ Use any tool that performs the delegated work directly
+- ❌ Bypass the team structure for any reason
 
 ## Workflow
 
@@ -255,12 +282,24 @@ Both helper scripts use `CLAUDE_PROJECT_DIR` to ensure:
 
 ## Error Handling
 
-| Error | Response |
-|-------|----------|
-| Gemini build fails | Review error, re-delegate with clearer instructions |
-| OpenCode test fails | Review failure, delegate fix to Gemini |
-| Timeout | Increase timeout or break task into smaller pieces |
-| Workspace error | Use `--include-directories` flag for external paths |
+| Error | Response | ⚠️ NEVER Do This |
+|-------|----------|------------------|
+| Gemini build fails | Review error, re-delegate with clearer instructions | Write code yourself |
+| OpenCode test fails | Review failure, delegate fix to Gemini | Run tests yourself with MCP tools |
+| Timeout | Increase timeout or break task into smaller pieces | Take over the task |
+| Workspace error | Use `--include-directories` flag for external paths | Bypass the team |
+| Tool slow/unresponsive | Wait, retry, or ask user for guidance | "Help" by doing it yourself |
+| No output from AI | Check status, retry with simpler task | Switch to doing work directly |
+
+### Escalation Path (When Stuck)
+
+```
+1. First: Wait longer (increase timeout)
+2. Second: Retry with simpler/clearer instructions
+3. Third: Break into smaller sub-tasks
+4. Fourth: ASK THE USER what to do
+5. NEVER: Take over and do the work yourself
+```
 
 ## Remember
 
@@ -268,3 +307,4 @@ Both helper scripts use `CLAUDE_PROJECT_DIR` to ensure:
 - Gemini builds, OpenCode tests - clear separation of duties
 - Iterate until quality is achieved - don't settle for broken code
 - Verify at every step - trust but verify both AI outputs
+- **NEVER take over when tools are slow** - you are a conductor, not a performer
